@@ -27,7 +27,7 @@ TOKEN    = os.environ.get("BOT_TOKEN", "")
 SITE     = "https://kingdomarchives.com"
 BASE_URL = f"{SITE}/playercards"
 IMG_ROOT = f"{SITE}/uploads/playercards/"
-PORT     = int(os.environ.get("PORT", 8080))
+PORT     = int(os.environ.get("PORT", 10000))
 
 KNOWN_SUBS = [
     "default", "skins", "battlepass", "drops",
@@ -631,12 +631,15 @@ def main():
     if not TOKEN:
         raise RuntimeError("BOT_TOKEN environment variable not set")
 
-    # warm cache in background
-    threading.Thread(target=refresh_cache, args=(True,), daemon=True).start()
-
-    # start Flask ping server
+    # Start Flask FIRST — Render health-checks immediately on deploy
     threading.Thread(target=run_flask, daemon=True).start()
     log.info(f"Ping server running on port {PORT}")
+
+    # Give Flask 2s to bind before anything else starts
+    time.sleep(2)
+
+    # Warm cache in background (non-blocking)
+    threading.Thread(target=refresh_cache, args=(True,), daemon=True).start()
 
     import asyncio
     asyncio.run(run_bot())

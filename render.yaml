@@ -7,6 +7,4 @@ services:
     envVars:
       - key: BOT_TOKEN
         sync: false
-      - key: PORT
-        value: 8080
     plan: free
