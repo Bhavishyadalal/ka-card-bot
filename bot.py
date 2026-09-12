@@ -248,7 +248,11 @@ def card_keyboard(name: str, sub: str, cur_size: str, page: int = 0) -> InlineKe
         InlineKeyboardButton("📥 Download", callback_data=f"dl|{name}|{sub}|{cur_size}"),
         InlineKeyboardButton("🔀 Random",   callback_data=f"rand|{cur_size}"),
     ]
-    return InlineKeyboardMarkup([size_row, action_row])
+    upscale_row = [
+        InlineKeyboardButton("🔍 Upscale 2x", callback_data=f"up|{name}|{sub}|{cur_size}|2"),
+        InlineKeyboardButton("🔍 Upscale 4x", callback_data=f"up|{name}|{sub}|{cur_size}|4"),
+    ]
+    return InlineKeyboardMarkup([size_row, action_row, upscale_row])
 
 def search_keyboard(results: list[dict], query: str, page: int, size: str) -> InlineKeyboardMarkup:
     rows = []
@@ -297,6 +301,32 @@ def category_keyboard(cards: list[dict], sub: str, page: int, size: str) -> Inli
         rows.append(nav)
     rows.append([InlineKeyboardButton("🔙 Back", callback_data=f"browse|{size}")])
     return InlineKeyboardMarkup(rows)
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  UPSCALE  (waifu2x public API)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+WAIFU2X_API = "https://api.waifu2x.udp.jp/api"
+
+def upscale_image(buf: BytesIO, scale: int = 2) -> BytesIO | None:
+    """Send image to waifu2x public API, return upscaled BytesIO or None."""
+    try:
+        buf.seek(0)
+        files   = {"file": ("card.png", buf, "image/png")}
+        payload = {
+            "scale": scale,
+            "noise": 1,       # mild denoise — good for VALORANT cards
+            "style": "art",   # art mode suits illustrations
+        }
+        r = http.post(WAIFU2X_API, data=payload, files=files, timeout=60)
+        r.raise_for_status()
+        out = BytesIO(r.content)
+        out.seek(0)
+        if out.getbuffer().nbytes < 2048:
+            return None
+        return out
+    except Exception as e:
+        log.warning(f"waifu2x upscale error: {e}")
+        return None
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  SEND CARD HELPER
@@ -566,6 +596,34 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             text,
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=category_keyboard(cards, sub, page, size)
+        )
+
+    # ── upscale ──
+    elif action == "up":
+        _, name, sub, size, scale = parts
+        scale = int(scale)
+        cards = get_cards()
+        card  = next((c for c in cards if c["name"] == name and c["sub"] == sub),
+                     {"name": name, "sub": sub, "display": name, "desc": ""})
+        url = probe_url(name, sub, size)
+        if not url:
+            await q.message.reply_text("⚠️ Could not find image to upscale.")
+            return
+        await q.message.reply_text(f"⏳ Upscaling {scale}x… this takes ~10 seconds.")
+        buf = fetch_image(url)
+        if not buf:
+            await q.message.reply_text("⚠️ Failed to fetch image.")
+            return
+        out = upscale_image(buf, scale)
+        if not out:
+            await q.message.reply_text("⚠️ Upscale failed. Try again in a moment.")
+            return
+        fname = f"{name}_{size}_{scale}x.png"
+        await q.message.reply_document(
+            document=out,
+            filename=fname,
+            caption=f"🔍 *{card['display']}*  •  {SIZE_LABELS[size]}  •  {scale}x upscaled",
+            parse_mode=ParseMode.MARKDOWN
         )
 
     # ── back to browse ──
