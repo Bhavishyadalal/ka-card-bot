@@ -4,6 +4,7 @@ Kingdom Archives — Telegram Bot
 Playercard search, preview, and download
 """
 
+import asyncio
 import os, re, random, logging, threading, time
 from io import BytesIO
 
@@ -641,7 +642,6 @@ def main():
     # Warm cache in background (non-blocking)
     threading.Thread(target=refresh_cache, args=(True,), daemon=True).start()
 
-    import asyncio
     asyncio.run(run_bot())
 
 if __name__ == "__main__":
