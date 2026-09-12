@@ -354,9 +354,7 @@ async def send_card(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = (
-        "⚡ *Kingdom Archives Card Bot*\n\n"
-        "Browse and download VALORANT playercards straight from "
-        "[kingdomarchives.com](https://kingdomarchives.com/playercards)\n\n"
+        "⚡ *VALORANT Playercard Bot*\n\n"
         "*Commands:*\n"
         "🔍 `/search <name>` — search cards\n"
         "📥 `/download <name>` — download a card\n"
@@ -364,11 +362,9 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "📂 `/browse` — browse by category\n"
         "🖼 `/size` — set preferred size\n"
         "📊 `/stats` — cache info\n"
-        "❓ `/help` — show this menu\n\n"
-        "_Bot is not affiliated with Riot Games or Kingdom Archives._"
+        "❓ `/help` — show this menu"
     )
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN,
-                                    disable_web_page_preview=True)
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await cmd_start(update, ctx)
@@ -613,8 +609,21 @@ async def run_bot():
     app.add_handler(CommandHandler("stats",    cmd_stats))
     app.add_handler(CallbackQueryHandler(on_callback))
 
+    # Register command menu in Telegram chatbox
+    from telegram import BotCommand
+    commands = [
+        BotCommand("search",   "Search cards by name"),
+        BotCommand("browse",   "Browse cards by category"),
+        BotCommand("random",   "Get a random playercard"),
+        BotCommand("download", "Download a card as file"),
+        BotCommand("size",     "Set preferred card size"),
+        BotCommand("stats",    "Show cache info"),
+        BotCommand("help",     "Show this menu"),
+    ]
+
     log.info("Bot starting…")
     await app.initialize()
+    await app.bot.set_my_commands(commands)
     await app.start()
     await app.updater.start_polling(
         allowed_updates=Update.ALL_TYPES,
