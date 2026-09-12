@@ -3,3 +3,4 @@ requests
 beautifulsoup4
 flask
 Pillow
+opencv-contrib-python-headless

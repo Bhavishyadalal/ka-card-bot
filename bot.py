@@ -305,45 +305,64 @@ def category_keyboard(cards: list[dict], sub: str, page: int, size: str) -> Inli
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  UPSCALE  (local PIL Lanczos — instant, no API needed)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Pre-load FSRCNN models once at startup (tiny — 39KB and 41KB)
+import os as _os
+_MODEL_DIR = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "models")
+
+def _load_sr(scale: int):
+    import cv2
+    sr = cv2.dnn_superres.DnnSuperResImpl_create()
+    sr.readModel(_os.path.join(_MODEL_DIR, f"FSRCNN_x{scale}.pb"))
+    sr.setModel("fsrcnn", scale)
+    return sr
+
+_SR_CACHE: dict = {}
+
+def _get_sr(scale: int):
+    if scale not in _SR_CACHE:
+        _SR_CACHE[scale] = _load_sr(scale)
+    return _SR_CACHE[scale]
+
 def upscale_image(buf: BytesIO, scale: int = 2) -> BytesIO | None:
-    """Upscale + enhance image locally: Lanczos resize + sharpen + contrast boost."""
+    """AI upscale using FSRCNN neural network + enhance pass."""
     try:
-        from PIL import Image, ImageFilter, ImageEnhance
+        import cv2
+        import numpy as np
+        from PIL import Image, ImageEnhance, ImageFilter
+
         buf.seek(0)
-        img = Image.open(buf).convert("RGBA")
-        w, h = img.size
+        img_pil = Image.open(buf).convert("RGBA")
+        w, h = img_pil.size
 
-        # Step 1 — Lanczos upscale
-        up = img.resize((w * scale, h * scale), Image.LANCZOS)
+        # Extract alpha to restore later
+        alpha = img_pil.split()[3]
 
-        # Step 2 — work on RGB for enhancement (RGBA sharpening has artifacts)
-        rgb = up.convert("RGB")
+        # FSRCNN works on BGR numpy array
+        img_rgb = img_pil.convert("RGB")
+        img_np  = np.array(img_rgb)
+        img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
 
-        # Step 3 — sharpen edges (run twice for stronger effect on 4x)
-        passes = 2 if scale >= 4 else 1
-        for _ in range(passes):
-            rgb = rgb.filter(ImageFilter.SHARPEN)
+        # AI upscale
+        sr     = _get_sr(scale)
+        up_bgr = sr.upsample(img_bgr)
 
-        # Step 4 — unsharp mask for crisp fine detail
-        rgb = rgb.filter(ImageFilter.UnsharpMask(radius=1.5, percent=120, threshold=2))
+        # Back to PIL RGB
+        up_rgb = cv2.cvtColor(up_bgr, cv2.COLOR_BGR2RGB)
+        up_pil = Image.fromarray(up_rgb)
 
-        # Step 5 — slight contrast boost so colors pop
-        rgb = ImageEnhance.Contrast(rgb).enhance(1.15)
+        # Enhancement pass — sharpen + contrast + color
+        up_pil = up_pil.filter(ImageFilter.UnsharpMask(radius=1.2, percent=100, threshold=2))
+        up_pil = ImageEnhance.Contrast(up_pil).enhance(1.1)
+        up_pil = ImageEnhance.Color(up_pil).enhance(1.08)
 
-        # Step 6 — slight color vibrancy boost
-        rgb = ImageEnhance.Color(rgb).enhance(1.1)
-
-        # Put alpha back
-        r, g, b = rgb.split()
-        _, _, _, a = up.split()
-        final = Image.merge("RGBA", (r, g, b, a))
+        # Restore upscaled alpha
+        up_alpha = alpha.resize((w * scale, h * scale), Image.LANCZOS)
+        up_pil.putalpha(up_alpha)
 
         out = BytesIO()
-        final.save(out, format="PNG")
+        up_pil.save(out, format="PNG")
         out.seek(0)
-        if out.getbuffer().nbytes < 2048:
-            return None
-        log.info(f"Upscaled+enhanced {w}x{h} -> {w*scale}x{h*scale}")
+        log.info(f"FSRCNN {scale}x: {w}x{h} -> {w*scale}x{h*scale}")
         return out
     except Exception as e:
         log.warning(f"Upscale error: {e}")
