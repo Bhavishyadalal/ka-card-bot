@@ -323,6 +323,8 @@ def _get_sr(scale: int):
         _SR_CACHE[scale] = _load_sr(scale)
     return _SR_CACHE[scale]
 
+MAX_UPSCALE_INPUT_DIM = 1600  # cap longest side before running FSRCNN (memory/time safety)
+
 def upscale_image(buf: BytesIO, scale: int = 2) -> BytesIO | None:
     """AI upscale using FSRCNN neural network + enhance pass."""
     try:
@@ -333,6 +335,14 @@ def upscale_image(buf: BytesIO, scale: int = 2) -> BytesIO | None:
         buf.seek(0)
         img_pil = Image.open(buf).convert("RGBA")
         w, h = img_pil.size
+
+        # Downscale very large source images first so FSRCNN stays fast
+        # and doesn't blow the memory budget on Render's free tier.
+        longest = max(w, h)
+        if longest > MAX_UPSCALE_INPUT_DIM:
+            ratio = MAX_UPSCALE_INPUT_DIM / longest
+            w, h = max(1, int(w * ratio)), max(1, int(h * ratio))
+            img_pil = img_pil.resize((w, h), Image.LANCZOS)
 
         # Extract alpha to restore later
         alpha = img_pil.split()[3]
@@ -432,7 +442,9 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "📂 `/browse` — browse by category\n"
         "🖼 `/size` — set preferred size\n"
         "📊 `/stats` — cache info\n"
-        "❓ `/help` — show this menu"
+        "🔍 `/upscale` — upscale your own image\n"
+        "❓ `/help` — show this menu\n\n"
+        "_Tip: just send me any photo directly and I'll offer to upscale it._"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
@@ -528,11 +540,19 @@ async def cmd_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Failed to fetch image.")
         return
     fname = f"{card['name']}_{size}.png"
+    token = register_temp_output(buf, suffix=".png")
+    buf.seek(0)
     await update.message.reply_document(
         document=buf,
         filename=fname,
         caption=f"📥 *{card['display']}*  •  {SIZE_LABELS[size]}",
         parse_mode=ParseMode.MARKDOWN
+    )
+    await update.message.reply_text(
+        "🗑 Want me to delete this image from the server now?\n"
+        "_If you don't tap the button, it'll be auto-deleted from server storage in 5 minutes._",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=delete_prompt_keyboard(token)
     )
 
 async def cmd_browse(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -541,6 +561,139 @@ async def cmd_browse(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "📂 *Browse by Category*\n\nChoose a category:",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=browse_keyboard(size)
+    )
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  TEMP FILE STORAGE + AUTO-CLEANUP  (free-tier disk hygiene)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+import uuid
+
+TMP_DIR = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "tmp_outputs")
+_os.makedirs(TMP_DIR, exist_ok=True)
+AUTO_DELETE_SECONDS = 5 * 60  # 5 minutes
+
+_pending_deletes: dict = {}  # token -> {"path": str, "timer": threading.Timer}
+
+def _save_temp_file(buf: BytesIO, suffix: str = ".png") -> tuple[str, str]:
+    """Writes buf to TMP_DIR under a random token filename. Returns (token, path)."""
+    token = uuid.uuid4().hex
+    path  = _os.path.join(TMP_DIR, f"{token}{suffix}")
+    buf.seek(0)
+    with open(path, "wb") as f:
+        f.write(buf.read())
+    return token, path
+
+def _delete_temp_file(token: str) -> bool:
+    """Deletes the stored file for token, if it still exists. Cancels its timer."""
+    entry = _pending_deletes.pop(token, None)
+    if entry is None:
+        return False
+    timer = entry.get("timer")
+    if timer:
+        timer.cancel()
+    path = entry["path"]
+    try:
+        if _os.path.exists(path):
+            _os.remove(path)
+            log.info(f"Deleted temp file {path}")
+        return True
+    except Exception as e:
+        log.warning(f"Failed to delete temp file {path}: {e}")
+        return False
+
+def _schedule_auto_delete(token: str):
+    timer = threading.Timer(AUTO_DELETE_SECONDS, _delete_temp_file, args=(token,))
+    timer.daemon = True
+    if token in _pending_deletes:
+        _pending_deletes[token]["timer"] = timer
+    timer.start()
+
+def register_temp_output(buf: BytesIO, suffix: str = ".png") -> str:
+    """Persists an in-memory output to disk, tracks it, and arms the 5-min auto-delete.
+    Returns the token used to reference it (in callback_data and for manual delete)."""
+    token, path = _save_temp_file(buf, suffix)
+    _pending_deletes[token] = {"path": path, "timer": None}
+    _schedule_auto_delete(token)
+    return token
+
+def delete_prompt_keyboard(token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🗑 Delete from server", callback_data=f"delimg|{token}")
+    ]])
+
+async def cmd_upscale(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🖼 *Upscale Your Own Image*\n\n"
+        "Just send me any photo or image file — no need to type anything else.\n"
+        "I'll come back with 2x and 4x upscale options.",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  USER PHOTO UPLOAD → UPSCALE
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MAX_USER_IMAGE_BYTES = 20 * 1024 * 1024  # Telegram bot API download cap
+
+def user_upscale_keyboard(file_id: str) -> InlineKeyboardMarkup:
+    # file_id is a Telegram-issued token — safe to embed directly in callback_data.
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔍 Upscale 2x", callback_data=f"upu|{file_id}|2"),
+        InlineKeyboardButton("🔍 Upscale 4x", callback_data=f"upu|{file_id}|4"),
+    ]])
+
+async def on_user_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handles a user sending a photo, or an image sent as a file/document."""
+    msg = update.message
+    tg_file = None
+    src_name = "image.png"
+
+    if msg.photo:
+        tg_file = await msg.photo[-1].get_file()  # highest-res variant
+    elif msg.document and (msg.document.mime_type or "").startswith("image/"):
+        if msg.document.file_size and msg.document.file_size > MAX_USER_IMAGE_BYTES:
+            await msg.reply_text("⚠️ That image is too large for me to fetch (20MB limit).")
+            return
+        tg_file = await msg.document.get_file()
+        src_name = msg.document.file_name or src_name
+    else:
+        return
+
+    await msg.reply_text(
+        "🖼 Got your image! Pick an upscale strength:",
+        reply_markup=user_upscale_keyboard(tg_file.file_id)
+    )
+
+async def _upscale_user_file(q, ctx: ContextTypes.DEFAULT_TYPE, file_id: str, scale: int):
+    await q.message.reply_text(f"⏳ Upscaling {scale}x… this takes ~10 seconds.")
+    try:
+        tg_file = await ctx.bot.get_file(file_id)
+        raw = await tg_file.download_as_bytearray()
+    except Exception as e:
+        log.warning(f"User image download error: {e}")
+        await q.message.reply_text("⚠️ Couldn't re-fetch that image — please send it again.")
+        return
+
+    buf = BytesIO(bytes(raw))
+    out = upscale_image(buf, scale)
+    if not out:
+        await q.message.reply_text("⚠️ Upscale failed. Try sending the image again.")
+        return
+
+    # Persist to disk so it can be deleted on request / auto-cleaned after 5 min.
+    token = register_temp_output(out, suffix=".png")
+
+    out.seek(0)
+    await q.message.reply_document(
+        document=out,
+        filename=f"upscaled_{scale}x.png",
+        caption=f"✅ *Upscaled {scale}x*\nSharpened + contrast/color enhanced.",
+        parse_mode=ParseMode.MARKDOWN
+    )
+    await q.message.reply_text(
+        "🗑 Want me to delete this image from the server now?\n"
+        "_If you don't tap the button, it'll be auto-deleted from server storage in 5 minutes._",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=delete_prompt_keyboard(token)
     )
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -588,11 +741,19 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.message.reply_text("⚠️ Failed to fetch image.")
             return
         fname = f"{name}_{size}.png"
+        token = register_temp_output(buf, suffix=".png")
+        buf.seek(0)
         await q.message.reply_document(
             document=buf,
             filename=fname,
             caption=f"📥 *{card['display']}*  •  {SIZE_LABELS[size]}",
             parse_mode=ParseMode.MARKDOWN
+        )
+        await q.message.reply_text(
+            "🗑 Want me to delete this image from the server now?\n"
+            "_If you don't tap the button, it'll be auto-deleted from server storage in 5 minutes._",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=delete_prompt_keyboard(token)
         )
 
     # ── random ──
@@ -658,13 +819,35 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not out:
             await q.message.reply_text("⚠️ Upscale failed. Try again in a moment.")
             return
+        token = register_temp_output(out, suffix=".png")
         fname = f"{name}_{size}_{scale}x.png"
+        out.seek(0)
         await q.message.reply_document(
             document=out,
             filename=fname,
             caption=f"🔍 *{card['display']}*  •  {SIZE_LABELS[size]}  •  {scale}x upscaled",
             parse_mode=ParseMode.MARKDOWN
         )
+        await q.message.reply_text(
+            "🗑 Want me to delete this image from the server now?\n"
+            "_If you don't tap the button, it'll be auto-deleted from server storage in 5 minutes._",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=delete_prompt_keyboard(token)
+        )
+
+    # ── delete a server-stored upscaled image (user-confirmed) ──
+    elif action == "delimg":
+        _, token = parts
+        ok = _delete_temp_file(token)
+        if ok:
+            await q.edit_message_text("✅ Deleted from server storage.")
+        else:
+            await q.edit_message_text("ℹ️ Already deleted (or auto-cleaned after 5 minutes).")
+
+    # ── upscale a user-uploaded image ──
+    elif action == "upu":
+        _, file_id, scale = parts
+        await _upscale_user_file(q, ctx, file_id, int(scale))
 
     # ── back to browse ──
     elif action == "browse":
@@ -705,6 +888,8 @@ async def run_bot():
     app.add_handler(CommandHandler("browse",   cmd_browse))
     app.add_handler(CommandHandler("size",     cmd_size))
     app.add_handler(CommandHandler("stats",    cmd_stats))
+    app.add_handler(CommandHandler("upscale",  cmd_upscale))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, on_user_image))
     app.add_handler(CallbackQueryHandler(on_callback))
 
     # Register command menu in Telegram chatbox
@@ -716,6 +901,7 @@ async def run_bot():
         BotCommand("download", "Download a card as file"),
         BotCommand("size",     "Set preferred card size"),
         BotCommand("stats",    "Show cache info"),
+        BotCommand("upscale",  "Upscale your own image"),
         BotCommand("help",     "Show this menu"),
     ]
 
