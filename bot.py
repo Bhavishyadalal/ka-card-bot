@@ -306,19 +306,44 @@ def category_keyboard(cards: list[dict], sub: str, page: int, size: str) -> Inli
 #  UPSCALE  (local PIL Lanczos — instant, no API needed)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def upscale_image(buf: BytesIO, scale: int = 2) -> BytesIO | None:
-    """Upscale image locally using PIL Lanczos resampling."""
+    """Upscale + enhance image locally: Lanczos resize + sharpen + contrast boost."""
     try:
-        from PIL import Image
+        from PIL import Image, ImageFilter, ImageEnhance
         buf.seek(0)
         img = Image.open(buf).convert("RGBA")
         w, h = img.size
+
+        # Step 1 — Lanczos upscale
         up = img.resize((w * scale, h * scale), Image.LANCZOS)
+
+        # Step 2 — work on RGB for enhancement (RGBA sharpening has artifacts)
+        rgb = up.convert("RGB")
+
+        # Step 3 — sharpen edges (run twice for stronger effect on 4x)
+        passes = 2 if scale >= 4 else 1
+        for _ in range(passes):
+            rgb = rgb.filter(ImageFilter.SHARPEN)
+
+        # Step 4 — unsharp mask for crisp fine detail
+        rgb = rgb.filter(ImageFilter.UnsharpMask(radius=1.5, percent=120, threshold=2))
+
+        # Step 5 — slight contrast boost so colors pop
+        rgb = ImageEnhance.Contrast(rgb).enhance(1.15)
+
+        # Step 6 — slight color vibrancy boost
+        rgb = ImageEnhance.Color(rgb).enhance(1.1)
+
+        # Put alpha back
+        r, g, b = rgb.split()
+        _, _, _, a = up.split()
+        final = Image.merge("RGBA", (r, g, b, a))
+
         out = BytesIO()
-        up.save(out, format="PNG")
+        final.save(out, format="PNG")
         out.seek(0)
         if out.getbuffer().nbytes < 2048:
             return None
-        log.info(f"Upscaled {w}x{h} -> {w*scale}x{h*scale}")
+        log.info(f"Upscaled+enhanced {w}x{h} -> {w*scale}x{h*scale}")
         return out
     except Exception as e:
         log.warning(f"Upscale error: {e}")
