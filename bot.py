@@ -303,29 +303,25 @@ def category_keyboard(cards: list[dict], sub: str, page: int, size: str) -> Inli
     return InlineKeyboardMarkup(rows)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  UPSCALE  (waifu2x public API)
+#  UPSCALE  (local PIL Lanczos — instant, no API needed)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-WAIFU2X_API = "https://api.waifu2x.udp.jp/api"
-
 def upscale_image(buf: BytesIO, scale: int = 2) -> BytesIO | None:
-    """Send image to waifu2x public API, return upscaled BytesIO or None."""
+    """Upscale image locally using PIL Lanczos resampling."""
     try:
+        from PIL import Image
         buf.seek(0)
-        files   = {"file": ("card.png", buf, "image/png")}
-        payload = {
-            "scale": scale,
-            "noise": 1,       # mild denoise — good for VALORANT cards
-            "style": "art",   # art mode suits illustrations
-        }
-        r = http.post(WAIFU2X_API, data=payload, files=files, timeout=60)
-        r.raise_for_status()
-        out = BytesIO(r.content)
+        img = Image.open(buf).convert("RGBA")
+        w, h = img.size
+        up = img.resize((w * scale, h * scale), Image.LANCZOS)
+        out = BytesIO()
+        up.save(out, format="PNG")
         out.seek(0)
         if out.getbuffer().nbytes < 2048:
             return None
+        log.info(f"Upscaled {w}x{h} -> {w*scale}x{h*scale}")
         return out
     except Exception as e:
-        log.warning(f"waifu2x upscale error: {e}")
+        log.warning(f"Upscale error: {e}")
         return None
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
