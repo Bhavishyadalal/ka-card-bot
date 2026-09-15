@@ -67,11 +67,13 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  CACHE  (in-memory, refreshed every 30 min)
+#  CACHE  (in-memory, refreshed every 30 min – non-blocking)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 _cache: list[dict] = []          # [{name, sub, display, desc}, ...]
 _cache_ts: float   = 0
 CACHE_TTL = 1800                 # 30 minutes
+_refresh_lock = threading.Lock()
+_refreshing = False
 
 http = requests.Session()
 http.headers.update(HEADERS)
@@ -127,11 +129,9 @@ def _next_page_url(soup: BeautifulSoup, cur: str) -> str | None:
         return cur + "?page=2"
     return None
 
-def refresh_cache(force: bool = False):
-    global _cache, _cache_ts
-    if not force and (time.time() - _cache_ts) < CACHE_TTL:
-        return
-
+def _do_refresh():
+    """Actual scraping work. Always runs in a background thread."""
+    global _cache, _cache_ts, _refreshing
     log.info("Refreshing card cache…")
     all_cards: list[dict] = []
     seen: set[str] = set()
@@ -173,7 +173,28 @@ def refresh_cache(force: bool = False):
     else:
         log.warning("Cache refresh got 0 cards")
 
+    with _refresh_lock:
+        _refreshing = False
+
+def refresh_cache(force: bool = False):
+    """Non-blocking. Starts a background refresh if needed, returns immediately."""
+    global _refreshing
+    now = time.time()
+    needs_refresh = force or (now - _cache_ts) >= CACHE_TTL
+
+    if not needs_refresh:
+        return
+
+    with _refresh_lock:
+        if _refreshing:
+            return          # already running
+        _refreshing = True
+
+    t = threading.Thread(target=_do_refresh, daemon=True)
+    t.start()
+
 def get_cards() -> list[dict]:
+    # Trigger background refresh if TTL expired, but always return current cache
     refresh_cache()
     return _cache
 
@@ -573,7 +594,6 @@ _os.makedirs(TMP_DIR, exist_ok=True)
 AUTO_DELETE_SECONDS = 5 * 60  # 5 minutes
 
 _pending_deletes: dict = {}  # token -> {"path": str, "timer": threading.Timer}
-_pending_uploads: dict = {}  # short token -> Telegram file_id (works around 64-byte callback_data limit)
 
 def _save_temp_file(buf: BytesIO, suffix: str = ".png") -> tuple[str, str]:
     """Writes buf to TMP_DIR under a random token filename. Returns (token, path)."""
@@ -635,98 +655,67 @@ async def cmd_upscale(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 MAX_USER_IMAGE_BYTES = 20 * 1024 * 1024  # Telegram bot API download cap
 
-def user_upscale_keyboard(token: str) -> InlineKeyboardMarkup:
-    # Telegram caps callback_data at 64 bytes, and file_ids often exceed that
-    # on their own — so we store the file_id server-side and pass a short token.
+def user_upscale_keyboard(file_id: str) -> InlineKeyboardMarkup:
+    # file_id is a Telegram-issued token — safe to embed directly in callback_data.
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("🔍 Upscale 2x", callback_data=f"upu|{token}|2"),
-        InlineKeyboardButton("🔍 Upscale 4x", callback_data=f"upu|{token}|4"),
+        InlineKeyboardButton("🔍 Upscale 2x", callback_data=f"upu|{file_id}|2"),
+        InlineKeyboardButton("🔍 Upscale 4x", callback_data=f"upu|{file_id}|4"),
     ]])
 
 async def on_user_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Handles a user sending a photo, or an image sent as a file/document."""
     msg = update.message
-    if not msg:
+    tg_file = None
+    src_name = "image.png"
+
+    if msg.photo:
+        tg_file = await msg.photo[-1].get_file()  # highest-res variant
+    elif msg.document and (msg.document.mime_type or "").startswith("image/"):
+        if msg.document.file_size and msg.document.file_size > MAX_USER_IMAGE_BYTES:
+            await msg.reply_text("⚠️ That image is too large for me to fetch (20MB limit).")
+            return
+        tg_file = await msg.document.get_file()
+        src_name = msg.document.file_name or src_name
+    else:
         return
-    try:
-        tg_file = None
-        src_name = "image.png"
 
-        if msg.photo:
-            tg_file = await msg.photo[-1].get_file()  # highest-res variant
-        elif msg.document and (msg.document.mime_type or "").startswith("image/"):
-            if msg.document.file_size and msg.document.file_size > MAX_USER_IMAGE_BYTES:
-                await msg.reply_text("⚠️ That image is too large for me to fetch (20MB limit).")
-                return
-            tg_file = await msg.document.get_file()
-            src_name = msg.document.file_name or src_name
-        else:
-            return
-
-        if not tg_file:
-            await msg.reply_text("⚠️ Couldn't read that image — please try sending it again.")
-            return
-
-        log.info(f"Received user image, file_id={tg_file.file_id}")
-        upload_token = uuid.uuid4().hex[:16]
-        _pending_uploads[upload_token] = tg_file.file_id
-        # Expire the token after 10 min so _pending_uploads doesn't grow forever
-        # on Render's free-tier RAM if users never tap a button.
-        expiry = threading.Timer(600, _pending_uploads.pop, args=(upload_token, None))
-        expiry.daemon = True
-        expiry.start()
-        await msg.reply_text(
-            "🖼 Got your image! Pick an upscale strength:",
-            reply_markup=user_upscale_keyboard(upload_token)
-        )
-    except Exception as e:
-        log.exception(f"on_user_image error: {e}")
-        try:
-            await msg.reply_text(
-                "⚠️ Something went wrong reading that image. Please try sending it again."
-            )
-        except Exception:
-            pass
+    await msg.reply_text(
+        "🖼 Got your image! Pick an upscale strength:",
+        reply_markup=user_upscale_keyboard(tg_file.file_id)
+    )
 
 async def _upscale_user_file(q, ctx: ContextTypes.DEFAULT_TYPE, file_id: str, scale: int):
+    await q.message.reply_text(f"⏳ Upscaling {scale}x… this takes ~10 seconds.")
     try:
-        await q.message.reply_text(f"⏳ Upscaling {scale}x… this takes ~10 seconds.")
-        try:
-            tg_file = await ctx.bot.get_file(file_id)
-            raw = await tg_file.download_as_bytearray()
-        except Exception as e:
-            log.warning(f"User image download error: {e}")
-            await q.message.reply_text("⚠️ Couldn't re-fetch that image — please send it again.")
-            return
-
-        buf = BytesIO(bytes(raw))
-        out = upscale_image(buf, scale)
-        if not out:
-            await q.message.reply_text("⚠️ Upscale failed. Try sending the image again.")
-            return
-
-        # Persist to disk so it can be deleted on request / auto-cleaned after 5 min.
-        token = register_temp_output(out, suffix=".png")
-
-        out.seek(0)
-        await q.message.reply_document(
-            document=out,
-            filename=f"upscaled_{scale}x.png",
-            caption=f"✅ *Upscaled {scale}x*\nSharpened + contrast/color enhanced.",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        await q.message.reply_text(
-            "🗑 Want me to delete this image from the server now?\n"
-            "_If you don't tap the button, it'll be auto-deleted from server storage in 5 minutes._",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=delete_prompt_keyboard(token)
-        )
+        tg_file = await ctx.bot.get_file(file_id)
+        raw = await tg_file.download_as_bytearray()
     except Exception as e:
-        log.exception(f"_upscale_user_file error: {e}")
-        try:
-            await q.message.reply_text("⚠️ Something went wrong during upscaling. Please try again.")
-        except Exception:
-            pass
+        log.warning(f"User image download error: {e}")
+        await q.message.reply_text("⚠️ Couldn't re-fetch that image — please send it again.")
+        return
+
+    buf = BytesIO(bytes(raw))
+    out = upscale_image(buf, scale)
+    if not out:
+        await q.message.reply_text("⚠️ Upscale failed. Try sending the image again.")
+        return
+
+    # Persist to disk so it can be deleted on request / auto-cleaned after 5 min.
+    token = register_temp_output(out, suffix=".png")
+
+    out.seek(0)
+    await q.message.reply_document(
+        document=out,
+        filename=f"upscaled_{scale}x.png",
+        caption=f"✅ *Upscaled {scale}x*\nSharpened + contrast/color enhanced.",
+        parse_mode=ParseMode.MARKDOWN
+    )
+    await q.message.reply_text(
+        "🗑 Want me to delete this image from the server now?\n"
+        "_If you don't tap the button, it'll be auto-deleted from server storage in 5 minutes._",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=delete_prompt_keyboard(token)
+    )
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  CALLBACK HANDLER
@@ -878,11 +867,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # ── upscale a user-uploaded image ──
     elif action == "upu":
-        _, upload_token, scale = parts
-        file_id = _pending_uploads.get(upload_token)
-        if not file_id:
-            await q.message.reply_text("⚠️ That upload has expired — please send the image again.")
-            return
+        _, file_id, scale = parts
         await _upscale_user_file(q, ctx, file_id, int(scale))
 
     # ── back to browse ──
@@ -911,24 +896,10 @@ def run_flask():
     flask_app.run(host="0.0.0.0", port=PORT, use_reloader=False)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  GLOBAL ERROR HANDLER  (so failures never go silent)
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE):
-    log.exception("Unhandled exception while processing update", exc_info=ctx.error)
-    try:
-        if isinstance(update, Update):
-            msg = update.effective_message
-            if msg:
-                await msg.reply_text("⚠️ Something went wrong. Please try again.")
-    except Exception:
-        pass
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  MAIN
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 async def run_bot():
     app = Application.builder().token(TOKEN).build()
-    app.add_error_handler(on_error)
 
     app.add_handler(CommandHandler("start",    cmd_start))
     app.add_handler(CommandHandler("help",     cmd_help))
